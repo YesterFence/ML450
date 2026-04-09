@@ -1,0 +1,463 @@
+{
+  "cells": [
+    {
+      "cell_type": "markdown",
+      "metadata": {},
+      "source": [
+        "---\n",
+        "title: \"ML 450 Final Project\"\n",
+        "subtitle: \"Flight Delay Predictions\"\n",
+        "author: \"Ryan Lee\"\n",
+        "format:\n",
+        "  html:\n",
+        "    self-contained: true\n",
+        "    page-layout: full\n",
+        "    title-block-banner: true\n",
+        "    toc: true\n",
+        "    toc-depth: 3\n",
+        "    toc-location: body\n",
+        "    number-sections: false\n",
+        "    html-math-method: katex\n",
+        "    code-fold: true\n",
+        "    code-summary: \"Show the code\"\n",
+        "    code-overflow: wrap\n",
+        "    code-copy: hover\n",
+        "    code-tools:\n",
+        "        source: false\n",
+        "        toggle: true\n",
+        "        caption: See code\n",
+        "execute:\n",
+        "  warning: false\n",
+        "\n",
+        "---\n",
+        "\n",
+        "# Predicting Flight Delays & Cancellations\n",
+        "\n",
+        "<!-- Data used from https://www.kaggle.com/datasets/usdot/flight-delays/data -->"
+      ],
+      "id": "868092db"
+    },
+    {
+      "cell_type": "code",
+      "metadata": {},
+      "source": [
+        "import pandas as pd\n",
+        "import numpy as np\n",
+        "import matplotlib.pyplot as plt\n",
+        "import seaborn as sns\n",
+        "from sklearn.ensemble import RandomForestClassifier\n",
+        "from sklearn.model_selection import train_test_split\n",
+        "from sklearn.metrics import classification_report, confusion_matrix, ConfusionMatrixDisplay\n",
+        "from sklearn.preprocessing import LabelEncoder\n",
+        "import kagglehub\n",
+        "import joblib"
+      ],
+      "id": "35df1171",
+      "execution_count": null,
+      "outputs": []
+    },
+    {
+      "cell_type": "code",
+      "metadata": {},
+      "source": [
+        "path = kagglehub.dataset_download(\"usdot/flight-delays\")\n",
+        "print(\"Path to dataset files:\", path)"
+      ],
+      "id": "6fedb6ff",
+      "execution_count": null,
+      "outputs": []
+    },
+    {
+      "cell_type": "code",
+      "metadata": {},
+      "source": [
+        "flights = pd.read_csv(f\"{path}/flights.csv\")\n",
+        "print(f\"Shape: {flights.shape}\")\n",
+        "print(flights.head())"
+      ],
+      "id": "c0679383",
+      "execution_count": null,
+      "outputs": []
+    },
+    {
+      "cell_type": "markdown",
+      "metadata": {},
+      "source": [
+        "## Data Preparation"
+      ],
+      "id": "7064cd1e"
+    },
+    {
+      "cell_type": "code",
+      "metadata": {},
+      "source": [
+        "# Target: 1 if flight was delayed more than 15 min OR cancelled, 0 otherwise\n",
+        "# DEPARTURE_DELAY is NaN for cancelled flights, so we handle both together\n",
+        "flights['is_delayed'] = (\n",
+        "    (flights['DEPARTURE_DELAY'] > 15) | (flights['CANCELLED'] == 1)\n",
+        ").astype(int)\n",
+        "\n",
+        "print(flights['is_delayed'].value_counts())\n",
+        "print(f\"\\nOverall delay/cancel rate: {flights['is_delayed'].mean():.2%}\")"
+      ],
+      "id": "f8a8d423",
+      "execution_count": null,
+      "outputs": []
+    },
+    {
+      "cell_type": "code",
+      "metadata": {},
+      "source": [
+        "# Keep only pre-flight features — nothing knowable only after the plane departs\n",
+        "feature_cols = ['MONTH', 'DAY', 'DAY_OF_WEEK', 'AIRLINE',\n",
+        "                'ORIGIN_AIRPORT', 'DESTINATION_AIRPORT',\n",
+        "                'SCHEDULED_DEPARTURE', 'DISTANCE']\n",
+        "\n",
+        "df_model = flights[feature_cols + ['is_delayed']].copy()\n",
+        "\n",
+        "# ORIGIN_AIRPORT and DESTINATION_AIRPORT can be mixed int/str — cast all to str\n",
+        "for col in ['AIRLINE', 'ORIGIN_AIRPORT', 'DESTINATION_AIRPORT']:\n",
+        "    df_model[col] = df_model[col].astype(str)\n",
+        "\n",
+        "# Drop rows missing any feature or the target\n",
+        "df_model = df_model.dropna()\n",
+        "\n",
+        "# Extract departure hour from SCHEDULED_DEPARTURE (e.g. 1430 → 14)\n",
+        "# Evening flights accumulate cascading delays — this is a strong predictor\n",
+        "df_model['departure_hour'] = (df_model['SCHEDULED_DEPARTURE'] // 100).astype(int)\n",
+        "df_model = df_model.drop(columns=['SCHEDULED_DEPARTURE'])\n",
+        "\n",
+        "# Update feature_cols to reflect the swap\n",
+        "feature_cols = ['MONTH', 'DAY', 'DAY_OF_WEEK', 'AIRLINE',\n",
+        "                'ORIGIN_AIRPORT', 'DESTINATION_AIRPORT',\n",
+        "                'departure_hour', 'DISTANCE']\n",
+        "\n",
+        "# Encode each categorical column with its own LabelEncoder\n",
+        "encoders = {}\n",
+        "for col in ['AIRLINE', 'ORIGIN_AIRPORT', 'DESTINATION_AIRPORT']:\n",
+        "    le = LabelEncoder()\n",
+        "    df_model[col] = le.fit_transform(df_model[col])\n",
+        "    encoders[col] = le  # save in case we need to decode later\n",
+        "\n",
+        "print(f\"Model dataset shape: {df_model.shape}\")\n",
+        "print(df_model.head())"
+      ],
+      "id": "c1efd0c4",
+      "execution_count": null,
+      "outputs": []
+    },
+    {
+      "cell_type": "markdown",
+      "metadata": {},
+      "source": [
+        "## Feature Selection\n",
+        "\n",
+        "### Correlation with Target"
+      ],
+      "id": "04aa6509"
+    },
+    {
+      "cell_type": "code",
+      "metadata": {},
+      "source": [
+        "corr = df_model[feature_cols + ['is_delayed']].corr()\n",
+        "\n",
+        "plt.figure(figsize=(8, 6))\n",
+        "sns.heatmap(\n",
+        "    corr[['is_delayed']].sort_values('is_delayed', ascending=False),\n",
+        "    annot=True, fmt='.2f', cmap='coolwarm', vmin=-1, vmax=1\n",
+        ")\n",
+        "plt.title('Feature Correlation with is_delayed')\n",
+        "plt.tight_layout()\n",
+        "plt.show()"
+      ],
+      "id": "a807a6df",
+      "execution_count": null,
+      "outputs": []
+    },
+    {
+      "cell_type": "markdown",
+      "metadata": {},
+      "source": [
+        "## Model Building\n",
+        "\n",
+        "### Train/Test Split"
+      ],
+      "id": "46daaf58"
+    },
+    {
+      "cell_type": "code",
+      "metadata": {},
+      "source": [
+        "X = df_model[feature_cols]\n",
+        "y = df_model['is_delayed']\n",
+        "\n",
+        "X_train, X_test, y_train, y_test = train_test_split(\n",
+        "    X, y, test_size=0.2, random_state=42\n",
+        ")\n",
+        "\n",
+        "print(f\"Train size: {X_train.shape}\")\n",
+        "print(f\"Test size:  {X_test.shape}\")"
+      ],
+      "id": "ddffa0f9",
+      "execution_count": null,
+      "outputs": []
+    },
+    {
+      "cell_type": "markdown",
+      "metadata": {},
+      "source": [
+        "### Target Encoding for Airport and Airline"
+      ],
+      "id": "d6b823c6"
+    },
+    {
+      "cell_type": "code",
+      "metadata": {},
+      "source": [
+        "# Replace label-encoded airport/airline integers with their historical delay rate\n",
+        "# Computed only from training rows to avoid leakage into the test set\n",
+        "X_train = X_train.copy()\n",
+        "X_test  = X_test.copy()\n",
+        "\n",
+        "for col in ['ORIGIN_AIRPORT', 'DESTINATION_AIRPORT', 'AIRLINE']:\n",
+        "    rate_map = X_train.assign(is_delayed=y_train).groupby(col)['is_delayed'].mean()\n",
+        "    X_train[col] = X_train[col].map(rate_map)\n",
+        "    # Test set airports not seen in training get the overall training mean\n",
+        "    X_test[col]  = X_test[col].map(rate_map).fillna(y_train.mean())\n",
+        "\n",
+        "print(\"Sample of target-encoded training features:\")\n",
+        "print(X_train.head())"
+      ],
+      "id": "3e2c965a",
+      "execution_count": null,
+      "outputs": []
+    },
+    {
+      "cell_type": "markdown",
+      "metadata": {},
+      "source": [
+        "### Random Forest Classifier"
+      ],
+      "id": "270a352e"
+    },
+    {
+      "cell_type": "code",
+      "metadata": {},
+      "source": [
+        "# class_weight={0:1, 1:2} — delays still count more than on-time flights,\n",
+        "# but less aggressively than 'balanced', which was hurting True Negative rate\n",
+        "forest = RandomForestClassifier(\n",
+        "    class_weight='balanced',\n",
+        "    random_state=17,\n",
+        "    min_samples_leaf=4,\n",
+        "    n_estimators=100,\n",
+        "    n_jobs=-1\n",
+        ")\n",
+        "forest.fit(X_train, y_train)\n",
+        "y_pred = forest.predict(X_test)\n",
+        "\n",
+        "print(classification_report(y_test, y_pred, target_names=['Not Delayed', 'Delayed']))"
+      ],
+      "id": "2e7a4949",
+      "execution_count": null,
+      "outputs": []
+    },
+    {
+      "cell_type": "markdown",
+      "metadata": {},
+      "source": [
+        "## Save & Load Model"
+      ],
+      "id": "fff08a4a"
+    },
+    {
+      "cell_type": "code",
+      "metadata": {},
+      "source": [
+        "# Save the trained model — only needs to run once\n",
+        "joblib.dump(forest, 'flight_delay_modelv2.joblib')\n",
+        "print(\"Model saved to flight_delay_modelv2.joblib\")"
+      ],
+      "id": "a7469d60",
+      "execution_count": null,
+      "outputs": []
+    },
+    {
+      "cell_type": "code",
+      "metadata": {},
+      "source": [
+        "# To load the model later instead of retraining, run this cell:\n",
+        "import os\n",
+        "_candidates = ['flight_delay_modelv2.joblib', 'Module7/flight_delay_modelv2.joblib']\n",
+        "_model_path = next(p for p in _candidates if os.path.exists(p))\n",
+        "forest = joblib.load(_model_path)\n",
+        "print(\"Model loaded\")"
+      ],
+      "id": "c9ee9d53",
+      "execution_count": null,
+      "outputs": []
+    },
+    {
+      "cell_type": "markdown",
+      "metadata": {},
+      "source": [
+        "### Feature Importance"
+      ],
+      "id": "860ac5f9"
+    },
+    {
+      "cell_type": "code",
+      "metadata": {},
+      "source": [
+        "importances = pd.Series(\n",
+        "    forest.feature_importances_, index=feature_cols\n",
+        ").sort_values(ascending=True)\n",
+        "\n",
+        "plt.figure(figsize=(7, 4))\n",
+        "importances.plot(kind='barh')\n",
+        "plt.title('Random Forest Feature Importances')\n",
+        "plt.xlabel('Importance')\n",
+        "plt.tight_layout()\n",
+        "plt.show()"
+      ],
+      "id": "27d18236",
+      "execution_count": null,
+      "outputs": []
+    },
+    {
+      "cell_type": "markdown",
+      "metadata": {},
+      "source": [
+        "### Confusion Matrix (Counts)"
+      ],
+      "id": "6be6164d"
+    },
+    {
+      "cell_type": "code",
+      "metadata": {},
+      "source": [
+        "cm = confusion_matrix(y_test, y_pred)\n",
+        "disp = ConfusionMatrixDisplay(confusion_matrix=cm, display_labels=['Not Delayed', 'Delayed'])\n",
+        "disp.plot(cmap='Blues')\n",
+        "plt.title('Confusion Matrix (Counts)')\n",
+        "plt.tight_layout()\n",
+        "plt.show()"
+      ],
+      "id": "4c97916e",
+      "execution_count": null,
+      "outputs": []
+    },
+    {
+      "cell_type": "markdown",
+      "metadata": {},
+      "source": [
+        "### Confusion Matrix (Percentages)"
+      ],
+      "id": "511a3d8e"
+    },
+    {
+      "cell_type": "code",
+      "metadata": {},
+      "source": [
+        "# normalize='true' shows what % of each actual class was predicted correctly/incorrectly\n",
+        "# Each row sums to 100% — row 0 = actual Not Delayed, row 1 = actual Delayed\n",
+        "cm_pct = confusion_matrix(y_test, y_pred, normalize='true')\n",
+        "disp_pct = ConfusionMatrixDisplay(confusion_matrix=cm_pct, display_labels=['Not Delayed', 'Delayed'])\n",
+        "disp_pct.plot(cmap='Blues', values_format='.1%')\n",
+        "plt.title('Confusion Matrix (% of Actual Class)')\n",
+        "plt.tight_layout()\n",
+        "plt.show()"
+      ],
+      "id": "9d47aec9",
+      "execution_count": null,
+      "outputs": []
+    },
+    {
+      "cell_type": "markdown",
+      "metadata": {},
+      "source": [
+        "### Confusion Matrix as Bar Chart"
+      ],
+      "id": "af8872f8"
+    },
+    {
+      "cell_type": "code",
+      "metadata": {},
+      "source": [
+        "# Label each cell of the confusion matrix for the bar chart\n",
+        "tn, fp, fn, tp = cm.ravel()\n",
+        "total = tn + fp + fn + tp\n",
+        "\n",
+        "labels  = ['True Negative\\n(Correct: Not Delayed)', 'False Positive\\n(Wrong: Said Delayed)',\n",
+        "           'False Negative\\n(Wrong: Missed Delay)',  'True Positive\\n(Correct: Delayed)']\n",
+        "counts  = [tn, fp, fn, tp]\n",
+        "colors  = ['steelblue', 'tomato', 'tomato', 'steelblue']\n",
+        "\n",
+        "plt.figure(figsize=(9, 5))\n",
+        "bars = plt.bar(labels, counts, color=colors, edgecolor='white', width=0.5)\n",
+        "\n",
+        "# Annotate each bar with count and percentage\n",
+        "for bar, count in zip(bars, counts):\n",
+        "    pct = count / total * 100\n",
+        "    plt.text(bar.get_x() + bar.get_width() / 2,\n",
+        "             bar.get_height() + total * 0.005,\n",
+        "             f'{count:,}\\n({pct:.1f}%)',\n",
+        "             ha='center', va='bottom', fontsize=9)\n",
+        "\n",
+        "plt.title('Confusion Matrix — Bar Chart')\n",
+        "plt.ylabel('Number of Flights')\n",
+        "plt.ylim(0, max(counts) * 1.15)\n",
+        "plt.tight_layout()\n",
+        "plt.show()"
+      ],
+      "id": "f7e72435",
+      "execution_count": null,
+      "outputs": []
+    },
+    {
+      "cell_type": "markdown",
+      "metadata": {},
+      "source": [
+        "### Predicted Probability Distribution"
+      ],
+      "id": "f52eb31c"
+    },
+    {
+      "cell_type": "code",
+      "metadata": {},
+      "source": [
+        "# How confident is the model? Separated by what actually happened.\n",
+        "# Well-separated humps = model is decisive; overlapping = model is uncertain\n",
+        "y_prob = forest.predict_proba(X_test)[:, 1]\n",
+        "prob_df = pd.DataFrame({'prob': y_prob, 'actual': y_test.values})\n",
+        "\n",
+        "plt.figure(figsize=(8, 5))\n",
+        "plt.hist(prob_df.loc[prob_df['actual'] == 0, 'prob'],\n",
+        "         bins=50, alpha=0.6, label='Actually Not Delayed', color='steelblue')\n",
+        "plt.hist(prob_df.loc[prob_df['actual'] == 1, 'prob'],\n",
+        "         bins=50, alpha=0.6, label='Actually Delayed', color='tomato')\n",
+        "plt.axvline(0.5, color='black', linestyle='--', linewidth=1, label='Decision threshold (0.5)')\n",
+        "plt.xlabel('Predicted Probability of Delay')\n",
+        "plt.ylabel('Number of Flights')\n",
+        "plt.title('Predicted Probability Distribution by Actual Outcome')\n",
+        "plt.legend()\n",
+        "plt.tight_layout()\n",
+        "plt.show()"
+      ],
+      "id": "bc73b862",
+      "execution_count": null,
+      "outputs": []
+    }
+  ],
+  "metadata": {
+    "kernelspec": {
+      "name": "python3",
+      "language": "python",
+      "display_name": "Python 3 (ipykernel)",
+      "path": "C:\\Users\\ryant\\AppData\\Roaming\\Python\\share\\jupyter\\kernels\\python3"
+    }
+  },
+  "nbformat": 4,
+  "nbformat_minor": 5
+}

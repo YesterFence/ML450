@@ -1,0 +1,271 @@
+---
+title: "ML 450 Final Project"
+subtitle: "Flight Delay Predictions"
+author: "Ryan Lee"
+format:
+  html:
+    self-contained: true
+    page-layout: full
+    title-block-banner: true
+    toc: true
+    toc-depth: 3
+    toc-location: body
+    number-sections: false
+    html-math-method: katex
+    code-fold: true
+    code-summary: "Show the code"
+    code-overflow: wrap
+    code-copy: hover
+    code-tools:
+        source: false
+        toggle: true
+        caption: See code
+execute:
+  warning: false
+
+---
+
+# Predicting Flight Delays & Cancellations
+
+<!-- Data used from https://www.kaggle.com/datasets/usdot/flight-delays/data -->
+
+```{python}
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+import seaborn as sns
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.model_selection import train_test_split
+from sklearn.metrics import classification_report, confusion_matrix, ConfusionMatrixDisplay
+from sklearn.preprocessing import LabelEncoder
+import kagglehub
+import joblib
+```
+
+```{python}
+path = kagglehub.dataset_download("usdot/flight-delays")
+print("Path to dataset files:", path)
+```
+
+```{python}
+flights = pd.read_csv(f"{path}/flights.csv")
+print(f"Shape: {flights.shape}")
+print(flights.head())
+```
+
+## Data Preparation
+
+```{python}
+# Target: 1 if flight was delayed more than 15 min OR cancelled, 0 otherwise
+# DEPARTURE_DELAY is NaN for cancelled flights, so we handle both together
+flights['is_delayed'] = (
+    (flights['DEPARTURE_DELAY'] > 15) | (flights['CANCELLED'] == 1)
+).astype(int)
+
+print(flights['is_delayed'].value_counts())
+print(f"\nOverall delay/cancel rate: {flights['is_delayed'].mean():.2%}")
+```
+
+```{python}
+# Keep only pre-flight features — nothing knowable only after the plane departs
+feature_cols = ['MONTH', 'DAY', 'DAY_OF_WEEK', 'AIRLINE',
+                'ORIGIN_AIRPORT', 'DESTINATION_AIRPORT',
+                'SCHEDULED_DEPARTURE', 'DISTANCE']
+
+df_model = flights[feature_cols + ['is_delayed']].copy()
+
+# ORIGIN_AIRPORT and DESTINATION_AIRPORT can be mixed int/str — cast all to str
+for col in ['AIRLINE', 'ORIGIN_AIRPORT', 'DESTINATION_AIRPORT']:
+    df_model[col] = df_model[col].astype(str)
+
+# Drop rows missing any feature or the target
+df_model = df_model.dropna()
+
+# Extract departure hour from SCHEDULED_DEPARTURE (e.g. 1430 → 14)
+# Evening flights accumulate cascading delays — this is a strong predictor
+df_model['departure_hour'] = (df_model['SCHEDULED_DEPARTURE'] // 100).astype(int)
+df_model = df_model.drop(columns=['SCHEDULED_DEPARTURE'])
+
+# Update feature_cols to reflect the swap
+feature_cols = ['MONTH', 'DAY', 'DAY_OF_WEEK', 'AIRLINE',
+                'ORIGIN_AIRPORT', 'DESTINATION_AIRPORT',
+                'departure_hour', 'DISTANCE']
+
+# Encode each categorical column with its own LabelEncoder
+encoders = {}
+for col in ['AIRLINE', 'ORIGIN_AIRPORT', 'DESTINATION_AIRPORT']:
+    le = LabelEncoder()
+    df_model[col] = le.fit_transform(df_model[col])
+    encoders[col] = le  # save in case we need to decode later
+
+print(f"Model dataset shape: {df_model.shape}")
+print(df_model.head())
+```
+
+## Feature Selection
+
+### Correlation with Target
+```{python}
+corr = df_model[feature_cols + ['is_delayed']].corr()
+
+plt.figure(figsize=(8, 6))
+sns.heatmap(
+    corr[['is_delayed']].sort_values('is_delayed', ascending=False),
+    annot=True, fmt='.2f', cmap='coolwarm', vmin=-1, vmax=1
+)
+plt.title('Feature Correlation with is_delayed')
+plt.tight_layout()
+plt.show()
+```
+
+## Model Building
+
+### Train/Test Split
+```{python}
+X = df_model[feature_cols]
+y = df_model['is_delayed']
+
+X_train, X_test, y_train, y_test = train_test_split(
+    X, y, test_size=0.2, random_state=42
+)
+
+print(f"Train size: {X_train.shape}")
+print(f"Test size:  {X_test.shape}")
+```
+
+### Target Encoding for Airport and Airline
+```{python}
+# Replace label-encoded airport/airline integers with their historical delay rate
+# Computed only from training rows to avoid leakage into the test set
+X_train = X_train.copy()
+X_test  = X_test.copy()
+
+for col in ['ORIGIN_AIRPORT', 'DESTINATION_AIRPORT', 'AIRLINE']:
+    rate_map = X_train.assign(is_delayed=y_train).groupby(col)['is_delayed'].mean()
+    X_train[col] = X_train[col].map(rate_map)
+    # Test set airports not seen in training get the overall training mean
+    X_test[col]  = X_test[col].map(rate_map).fillna(y_train.mean())
+
+print("Sample of target-encoded training features:")
+print(X_train.head())
+```
+
+### Random Forest Classifier
+```{python}
+# class_weight={0:1, 1:2} — delays still count more than on-time flights,
+# but less aggressively than 'balanced', which was hurting True Negative rate
+forest = RandomForestClassifier(
+    class_weight='balanced',
+    random_state=17,
+    min_samples_leaf=4,
+    n_estimators=100,
+    n_jobs=-1
+)
+forest.fit(X_train, y_train)
+y_pred = forest.predict(X_test)
+
+print(classification_report(y_test, y_pred, target_names=['Not Delayed', 'Delayed']))
+```
+
+## Save & Load Model
+
+```{python}
+# Save the trained model — only needs to run once
+joblib.dump(forest, 'flight_delay_modelv2.joblib')
+print("Model saved to flight_delay_modelv2.joblib")
+```
+
+```{python}
+# To load the model later instead of retraining, run this cell:
+import os
+_candidates = ['flight_delay_modelv2.joblib', 'Module7/flight_delay_modelv2.joblib']
+_model_path = next(p for p in _candidates if os.path.exists(p))
+forest = joblib.load(_model_path)
+print("Model loaded")
+```
+
+### Feature Importance
+```{python}
+importances = pd.Series(
+    forest.feature_importances_, index=feature_cols
+).sort_values(ascending=True)
+
+plt.figure(figsize=(7, 4))
+importances.plot(kind='barh')
+plt.title('Random Forest Feature Importances')
+plt.xlabel('Importance')
+plt.tight_layout()
+plt.show()
+```
+
+### Confusion Matrix (Counts)
+```{python}
+cm = confusion_matrix(y_test, y_pred)
+disp = ConfusionMatrixDisplay(confusion_matrix=cm, display_labels=['Not Delayed', 'Delayed'])
+disp.plot(cmap='Blues')
+plt.title('Confusion Matrix (Counts)')
+plt.tight_layout()
+plt.show()
+```
+
+### Confusion Matrix (Percentages)
+```{python}
+# normalize='true' shows what % of each actual class was predicted correctly/incorrectly
+# Each row sums to 100% — row 0 = actual Not Delayed, row 1 = actual Delayed
+cm_pct = confusion_matrix(y_test, y_pred, normalize='true')
+disp_pct = ConfusionMatrixDisplay(confusion_matrix=cm_pct, display_labels=['Not Delayed', 'Delayed'])
+disp_pct.plot(cmap='Blues', values_format='.1%')
+plt.title('Confusion Matrix (% of Actual Class)')
+plt.tight_layout()
+plt.show()
+```
+
+### Confusion Matrix as Bar Chart
+```{python}
+# Label each cell of the confusion matrix for the bar chart
+tn, fp, fn, tp = cm.ravel()
+total = tn + fp + fn + tp
+
+labels  = ['True Negative\n(Correct: Not Delayed)', 'False Positive\n(Wrong: Said Delayed)',
+           'False Negative\n(Wrong: Missed Delay)',  'True Positive\n(Correct: Delayed)']
+counts  = [tn, fp, fn, tp]
+colors  = ['steelblue', 'tomato', 'tomato', 'steelblue']
+
+plt.figure(figsize=(9, 5))
+bars = plt.bar(labels, counts, color=colors, edgecolor='white', width=0.5)
+
+# Annotate each bar with count and percentage
+for bar, count in zip(bars, counts):
+    pct = count / total * 100
+    plt.text(bar.get_x() + bar.get_width() / 2,
+             bar.get_height() + total * 0.005,
+             f'{count:,}\n({pct:.1f}%)',
+             ha='center', va='bottom', fontsize=9)
+
+plt.title('Confusion Matrix — Bar Chart')
+plt.ylabel('Number of Flights')
+plt.ylim(0, max(counts) * 1.15)
+plt.tight_layout()
+plt.show()
+```
+
+### Predicted Probability Distribution
+```{python}
+# How confident is the model? Separated by what actually happened.
+# Well-separated humps = model is decisive; overlapping = model is uncertain
+y_prob = forest.predict_proba(X_test)[:, 1]
+prob_df = pd.DataFrame({'prob': y_prob, 'actual': y_test.values})
+
+plt.figure(figsize=(8, 5))
+plt.hist(prob_df.loc[prob_df['actual'] == 0, 'prob'],
+         bins=50, alpha=0.6, label='Actually Not Delayed', color='steelblue')
+plt.hist(prob_df.loc[prob_df['actual'] == 1, 'prob'],
+         bins=50, alpha=0.6, label='Actually Delayed', color='tomato')
+plt.axvline(0.5, color='black', linestyle='--', linewidth=1, label='Decision threshold (0.5)')
+plt.xlabel('Predicted Probability of Delay')
+plt.ylabel('Number of Flights')
+plt.title('Predicted Probability Distribution by Actual Outcome')
+plt.legend()
+plt.tight_layout()
+plt.show()
+```
