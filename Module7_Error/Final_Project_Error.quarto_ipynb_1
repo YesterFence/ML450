@@ -1,0 +1,402 @@
+{
+  "cells": [
+    {
+      "cell_type": "markdown",
+      "metadata": {},
+      "source": [
+        "---\n",
+        "title: \"ML 450 Final Project\"\n",
+        "subtitle: \"Flight Delay Predictions\"\n",
+        "author: \"Ryan Lee\"\n",
+        "format:\n",
+        "  html:\n",
+        "    self-contained: true\n",
+        "    page-layout: full\n",
+        "    title-block-banner: true\n",
+        "    toc: true\n",
+        "    toc-depth: 3\n",
+        "    toc-location: body\n",
+        "    number-sections: false\n",
+        "    html-math-method: katex\n",
+        "    code-fold: true\n",
+        "    code-summary: \"Show the code\"\n",
+        "    code-overflow: wrap\n",
+        "    code-copy: hover\n",
+        "    code-tools:\n",
+        "        source: false\n",
+        "        toggle: true\n",
+        "        caption: See code\n",
+        "execute: \n",
+        "  warning: false\n",
+        "    \n",
+        "---\n",
+        "\n",
+        "# This is to predict if flights will be delayed or not. \n",
+        "\n",
+        "<!-- Data used from https://www.kaggle.com/datasets/usdot/flight-delays/data -->"
+      ],
+      "id": "6912a129"
+    },
+    {
+      "cell_type": "code",
+      "metadata": {},
+      "source": [
+        "import pandas as pd\n",
+        "import numpy as np\n",
+        "import matplotlib.pyplot as plt\n",
+        "import seaborn as sns\n",
+        "from sklearn.ensemble import RandomForestClassifier, GradientBoostingClassifier\n",
+        "from sklearn.model_selection import train_test_split, cross_val_score\n",
+        "from sklearn.metrics import classification_report, confusion_matrix, roc_auc_score\n",
+        "from sklearn.preprocessing import LabelEncoder\n",
+        "import kagglehub"
+      ],
+      "id": "fad81e0d",
+      "execution_count": null,
+      "outputs": []
+    },
+    {
+      "cell_type": "code",
+      "metadata": {},
+      "source": [
+        "# Download latest version\n",
+        "path = kagglehub.dataset_download(\"usdot/flight-delays\")\n",
+        "print(\"Path to dataset files:\", path)"
+      ],
+      "id": "36eadc29",
+      "execution_count": null,
+      "outputs": []
+    },
+    {
+      "cell_type": "code",
+      "metadata": {},
+      "source": [
+        "flights = pd.read_csv(f\"{path}/flights.csv\")\n",
+        "airlines = pd.read_csv(f\"{path}/airlines.csv\")\n",
+        "airports = pd.read_csv(f\"{path}/airports.csv\")"
+      ],
+      "id": "8c690c20",
+      "execution_count": null,
+      "outputs": []
+    },
+    {
+      "cell_type": "code",
+      "metadata": {},
+      "source": [
+        "df_cleaned = flights.groupby(['ORIGIN_AIRPORT', 'MONTH']).agg(\n",
+        "    num_of_flights_total=('FLIGHT_NUMBER', 'count'),\n",
+        "    # Keep num_of_delays_total only to compute the target, then drop it\n",
+        "    num_of_delays_total=('DEPARTURE_DELAY', lambda x: (x > 15).sum()),\n",
+        "    # minutes_delayed_total removed — directly encodes delay severity (leakage)\n",
+        "    num_of_delays_weather=('WEATHER_DELAY', lambda x: (x > 0).sum()),\n",
+        "    num_of_delays_carrier=('AIRLINE_DELAY', lambda x: (x > 0).sum()),\n",
+        "    num_of_delays_late_aircraft=('LATE_AIRCRAFT_DELAY', lambda x: (x > 0).sum())\n",
+        ").reset_index()\n",
+        "\n",
+        "df_cleaned = df_cleaned.rename(columns={'ORIGIN_AIRPORT': 'airport_code', 'MONTH': 'month'})\n",
+        "\n",
+        "# Compute target first, then drop its numerator so it can't leak into features\n",
+        "df_cleaned['delay_rate'] = df_cleaned['num_of_delays_total'] / df_cleaned['num_of_flights_total']\n",
+        "df_cleaned = df_cleaned.drop(columns=['num_of_delays_total'])"
+      ],
+      "id": "b3cb0a47",
+      "execution_count": null,
+      "outputs": []
+    },
+    {
+      "cell_type": "markdown",
+      "metadata": {},
+      "source": [
+        "### Reading Flight Missing Data"
+      ],
+      "id": "da738b98"
+    },
+    {
+      "cell_type": "code",
+      "metadata": {},
+      "source": [
+        "mfd = pd.read_json(\"https://github.com/byuidatascience/data4missing/raw/master/data-raw/flights_missing/flights_missing.json\")"
+      ],
+      "id": "43b202f0",
+      "execution_count": null,
+      "outputs": []
+    },
+    {
+      "cell_type": "code",
+      "metadata": {},
+      "source": [
+        "mfd_clean = mfd.replace(-999, np.nan)\n",
+        "\n",
+        "# Compute target — num_of_delays_total is the numerator so drop it after\n",
+        "mfd_clean['delay_rate'] = mfd_clean['num_of_delays_total'] / mfd_clean['num_of_flights_total']\n",
+        "mfd_clean = mfd_clean.drop(columns=['num_of_delays_total', 'minutes_delayed_total'], errors='ignore')\n",
+        "\n",
+        "print(mfd_clean.shape)\n",
+        "print(mfd_clean.head())"
+      ],
+      "id": "500b2166",
+      "execution_count": null,
+      "outputs": []
+    },
+    {
+      "cell_type": "markdown",
+      "metadata": {},
+      "source": [
+        "### Merge airports with mfd_clean"
+      ],
+      "id": "179d558d"
+    },
+    {
+      "cell_type": "code",
+      "metadata": {},
+      "source": [
+        "# airports.csv uses IATA_CODE; mfd_clean uses airport_code — same 3-letter IATA standard\n",
+        "# mfd_clean already has airport_name, so only pull CITY and STATE from airports.csv\n",
+        "airports_info = airports[['IATA_CODE', 'CITY', 'STATE']].rename(\n",
+        "    columns={'IATA_CODE': 'airport_code'}\n",
+        ")\n",
+        "\n",
+        "# Left join: every unique airport_code in mfd_clean is matched against\n",
+        "# every unique IATA_CODE in airports_info; unmatched rows get NaN\n",
+        "mfd_airports = mfd_clean.merge(airports_info, on='airport_code', how='left')\n",
+        "\n",
+        "# Show how many codes matched correctly\n",
+        "unmatched = mfd_airports['CITY'].isna().sum()\n",
+        "print(f\"Rows with unmatched airport code: {unmatched} / {len(mfd_airports)}\")\n",
+        "print(mfd_airports[['airport_code', 'airport_name', 'CITY', 'STATE', 'delay_rate']].head(10))"
+      ],
+      "id": "9821199f",
+      "execution_count": null,
+      "outputs": []
+    },
+    {
+      "cell_type": "markdown",
+      "metadata": {},
+      "source": [
+        "## Feature Selection\n",
+        "\n",
+        "### Correlation with Target"
+      ],
+      "id": "46379a0c"
+    },
+    {
+      "cell_type": "code",
+      "metadata": {},
+      "source": [
+        "# Some airport codes are numeric FAA IDs (e.g. 10135) mixed with IATA strings — cast all to str first\n",
+        "df_cleaned['airport_code'] = df_cleaned['airport_code'].astype(str)\n",
+        "\n",
+        "# Encode airport_code as an integer so it shows up in the correlation matrix\n",
+        "le = LabelEncoder()\n",
+        "df_cleaned['airport_code_enc'] = le.fit_transform(df_cleaned['airport_code'])\n",
+        "\n",
+        "feature_cols = ['airport_code_enc', 'month', 'num_of_flights_total',\n",
+        "                'num_of_delays_weather', 'num_of_delays_carrier',\n",
+        "                'num_of_delays_late_aircraft']\n",
+        "\n",
+        "corr = df_cleaned[feature_cols + ['delay_rate']].corr()\n",
+        "\n",
+        "plt.figure(figsize=(8, 6))\n",
+        "sns.heatmap(corr[['delay_rate']].sort_values('delay_rate', ascending=False),\n",
+        "            annot=True, fmt='.2f', cmap='coolwarm', vmin=-1, vmax=1)\n",
+        "plt.title('Feature Correlation with delay_rate')\n",
+        "plt.tight_layout()\n",
+        "plt.show()"
+      ],
+      "id": "1cd22217",
+      "execution_count": null,
+      "outputs": []
+    },
+    {
+      "cell_type": "markdown",
+      "metadata": {},
+      "source": [
+        "## Model Building\n",
+        "\n",
+        "### Train/Test Split"
+      ],
+      "id": "bb4fb221"
+    },
+    {
+      "cell_type": "code",
+      "metadata": {},
+      "source": [
+        "X = df_cleaned[feature_cols]\n",
+        "y = df_cleaned['delay_rate']\n",
+        "\n",
+        "X_train, X_test, y_train, y_test = train_test_split(\n",
+        "    X, y, test_size=0.2, random_state=42\n",
+        ")\n",
+        "\n",
+        "print(f\"Train size: {X_train.shape}, Test size: {X_test.shape}\")"
+      ],
+      "id": "64ce88fc",
+      "execution_count": null,
+      "outputs": []
+    },
+    {
+      "cell_type": "markdown",
+      "metadata": {},
+      "source": [
+        "### Random Forest — Feature Importance"
+      ],
+      "id": "8b666afb"
+    },
+    {
+      "cell_type": "code",
+      "metadata": {},
+      "source": [
+        "from sklearn.ensemble import RandomForestRegressor\n",
+        "from sklearn.metrics import mean_absolute_error, r2_score\n",
+        "\n",
+        "rf = RandomForestRegressor(n_estimators=100, random_state=42)\n",
+        "rf.fit(X_train, y_train)\n",
+        "\n",
+        "# Feature importance plot — use this to decide which columns to keep\n",
+        "importances = pd.Series(rf.feature_importances_, index=feature_cols).sort_values(ascending=True)\n",
+        "\n",
+        "plt.figure(figsize=(7, 4))\n",
+        "importances.plot(kind='barh')\n",
+        "plt.title('Random Forest Feature Importances')\n",
+        "plt.xlabel('Importance')\n",
+        "plt.tight_layout()\n",
+        "plt.show()"
+      ],
+      "id": "8409a810",
+      "execution_count": null,
+      "outputs": []
+    },
+    {
+      "cell_type": "markdown",
+      "metadata": {},
+      "source": [
+        "### Model Evaluation (80/20 split on df_cleaned)"
+      ],
+      "id": "cf61f1f3"
+    },
+    {
+      "cell_type": "code",
+      "metadata": {},
+      "source": [
+        "y_pred = rf.predict(X_test)\n",
+        "\n",
+        "mae  = mean_absolute_error(y_test, y_pred)\n",
+        "r2   = r2_score(y_test, y_pred)\n",
+        "\n",
+        "print(f\"MAE:  {mae:.4f}\")\n",
+        "print(f\"R²:   {r2:.4f}\")"
+      ],
+      "id": "4d17c999",
+      "execution_count": null,
+      "outputs": []
+    },
+    {
+      "cell_type": "code",
+      "metadata": {},
+      "source": [
+        "# Convert continuous predictions to binary (delayed = predicted delay > 0)\n",
+        "y_pred_binary = (y_pred > 0).astype(int)\n",
+        "y_test_binary = (y_test > 0).astype(int)\n",
+        "print(classification_report(y_test_binary, y_pred_binary))\n",
+        "t2 = confusion_matrix(y_test_binary, y_pred_binary)"
+      ],
+      "id": "47f153d0",
+      "execution_count": null,
+      "outputs": []
+    },
+    {
+      "cell_type": "markdown",
+      "metadata": {},
+      "source": [
+        "## Blind Test — Dataset 2 (mfd_airports)\n",
+        "\n",
+        "<!-- ```{python}\n",
+        "# mfd_airports stores month as names (\"January\") — convert to integers to match df_cleaned\n",
+        "month_map = {'January':1,'February':2,'March':3,'April':4,'May':5,'June':6,\n",
+        "             'July':7,'August':8,'September':9,'October':10,'November':11,'December':12}\n",
+        "mfd_airports['month'] = mfd_airports['month'].map(month_map)\n",
+        "\n",
+        "# Some numeric columns contain strings like '1500+' — strip the '+' and cast to float\n",
+        "numeric_cols = ['num_of_flights_total', 'num_of_delays_weather',\n",
+        "                'num_of_delays_carrier', 'num_of_delays_late_aircraft']\n",
+        "for col in numeric_cols:\n",
+        "    if col in mfd_airports.columns:\n",
+        "        mfd_airports[col] = mfd_airports[col].astype(str).str.replace('+', '', regex=False)\n",
+        "        mfd_airports[col] = pd.to_numeric(mfd_airports[col], errors='coerce')\n",
+        "\n",
+        "# Align airport_code types and encode using the same LabelEncoder fitted on df_cleaned\n",
+        "# Codes not seen during training are marked as 'unknown' to avoid errors\n",
+        "mfd_airports['airport_code'] = mfd_airports['airport_code'].astype(str)\n",
+        "known_codes = set(le.classes_)\n",
+        "mfd_airports['airport_code_safe'] = mfd_airports['airport_code'].apply(\n",
+        "    lambda x: x if x in known_codes else 'unknown'\n",
+        ")\n",
+        "\n",
+        "# Add 'unknown' to the encoder if any new codes exist, then transform\n",
+        "if 'unknown' not in known_codes:\n",
+        "    le.classes_ = np.append(le.classes_, 'unknown')\n",
+        "\n",
+        "mfd_airports['airport_code_enc'] = le.transform(mfd_airports['airport_code_safe'])\n",
+        "\n",
+        "# Hide the true delay_rate — these are the answers we're trying to predict\n",
+        "blind_features = ['airport_code_enc', 'month', 'num_of_flights_total',\n",
+        "                  'num_of_delays_weather', 'num_of_delays_carrier',\n",
+        "                  'num_of_delays_late_aircraft']\n",
+        "\n",
+        "X_blind = mfd_airports[blind_features].copy()\n",
+        "y_true  = mfd_airports['delay_rate'].copy()   # the hidden answers\n",
+        "\n",
+        "# Drop rows where any feature is NaN (from -999 replacement earlier)\n",
+        "valid_mask = X_blind.notna().all(axis=1) & y_true.notna()\n",
+        "X_blind = X_blind[valid_mask]\n",
+        "y_true  = y_true[valid_mask]\n",
+        "``` -->\n",
+        "\n",
+        "### Predictions vs Actuals\n",
+        "<!-- ```{python}\n",
+        "y_blind_pred = rf.predict(X_blind)\n",
+        "\n",
+        "mae_blind = mean_absolute_error(y_true, y_blind_pred)\n",
+        "r2_blind  = r2_score(y_true, y_blind_pred)\n",
+        "\n",
+        "print(f\"Blind Test MAE: {mae_blind:.4f}  (vs training MAE: {mae:.4f})\")\n",
+        "print(f\"Blind Test R²:  {r2_blind:.4f}  (vs training R²:  {r2:.4f})\")\n",
+        "\n",
+        "# Side-by-side comparison table\n",
+        "results = mfd_airports.loc[y_true.index, ['airport_code', 'airport_name', 'month']].copy()\n",
+        "results['actual_delay_rate']    = y_true.values\n",
+        "results['predicted_delay_rate'] = y_blind_pred\n",
+        "results['error'] = (results['predicted_delay_rate'] - results['actual_delay_rate']).abs()\n",
+        "results = results.sort_values('error', ascending=False)\n",
+        "\n",
+        "print(\"\\nLargest prediction errors:\")\n",
+        "print(results.head(10).to_string(index=False))\n",
+        "``` -->\n",
+        "\n",
+        "### Predicted vs Actual Scatter Plot\n",
+        "<!-- ```{python}\n",
+        "plt.figure(figsize=(7, 6))\n",
+        "plt.scatter(y_true, y_blind_pred, alpha=0.4, edgecolors='none')\n",
+        "plt.plot([0, 1], [0, 1], 'r--', linewidth=1, label='Perfect prediction')\n",
+        "plt.xlabel('Actual delay_rate')\n",
+        "plt.ylabel('Predicted delay_rate')\n",
+        "plt.title('Blind Test: Predicted vs Actual Delay Rate (Dataset 2)')\n",
+        "plt.legend()\n",
+        "plt.tight_layout()\n",
+        "plt.show()\n",
+        "``` -->"
+      ],
+      "id": "cdc36944"
+    }
+  ],
+  "metadata": {
+    "kernelspec": {
+      "name": "python3",
+      "language": "python",
+      "display_name": "Python 3 (ipykernel)",
+      "path": "C:\\Users\\ryant\\AppData\\Roaming\\Python\\share\\jupyter\\kernels\\python3"
+    }
+  },
+  "nbformat": 4,
+  "nbformat_minor": 5
+}

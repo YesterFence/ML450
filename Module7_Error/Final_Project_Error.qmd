@@ -177,14 +177,17 @@ print(f"R²:   {r2:.4f}")
 
 
 ```{python}
-print(classification_report(y_test, y_pred))
-t2 = confusion_matrix(y_test, y_pred)
+# Convert continuous predictions to binary (delayed = predicted delay > 0)
+y_pred_binary = (y_pred > 0).astype(int)
+y_test_binary = (y_test > 0).astype(int)
+print(classification_report(y_test_binary, y_pred_binary))
+t2 = confusion_matrix(y_test_binary, y_pred_binary)
 ```
 
 
 ## Blind Test — Dataset 2 (mfd_airports)
 
-```{python}
+<!-- ```{python}
 # mfd_airports stores month as names ("January") — convert to integers to match df_cleaned
 month_map = {'January':1,'February':2,'March':3,'April':4,'May':5,'June':6,
              'July':7,'August':8,'September':9,'October':10,'November':11,'December':12}
@@ -224,10 +227,10 @@ y_true  = mfd_airports['delay_rate'].copy()   # the hidden answers
 valid_mask = X_blind.notna().all(axis=1) & y_true.notna()
 X_blind = X_blind[valid_mask]
 y_true  = y_true[valid_mask]
-```
+``` -->
 
 ### Predictions vs Actuals
-```{python}
+<!-- ```{python}
 y_blind_pred = rf.predict(X_blind)
 
 mae_blind = mean_absolute_error(y_true, y_blind_pred)
@@ -245,10 +248,10 @@ results = results.sort_values('error', ascending=False)
 
 print("\nLargest prediction errors:")
 print(results.head(10).to_string(index=False))
-```
+``` -->
 
 ### Predicted vs Actual Scatter Plot
-```{python}
+<!-- ```{python}
 plt.figure(figsize=(7, 6))
 plt.scatter(y_true, y_blind_pred, alpha=0.4, edgecolors='none')
 plt.plot([0, 1], [0, 1], 'r--', linewidth=1, label='Perfect prediction')
@@ -258,4 +261,4 @@ plt.title('Blind Test: Predicted vs Actual Delay Rate (Dataset 2)')
 plt.legend()
 plt.tight_layout()
 plt.show()
-```
+``` -->
